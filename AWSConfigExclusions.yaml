@@ -1,0 +1,218 @@
+Resources:
+
+  ConfigExclusionsDB:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: AWSConfigExclusions
+      AttributeDefinitions:
+        - AttributeName: group_name
+          AttributeType: S
+      KeySchema:
+        - AttributeName: group_name
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+
+  ConfigExclusionsLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: AWSConfigExclusions
+      Handler: index.lambda_handler
+      Role: !GetAtt ConfigExclusionsRole.Arn
+      Code:
+        ZipFile: |
+          #
+          # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+          # SPDX-License-Identifier: MIT-0
+          #
+          # Permission is hereby granted, free of charge, to any person obtaining
+          # a copy of this software and associated documentation files (the "Software"),
+          # to deal in the Software without restriction, including without limitation
+          # the rights to use, copy, modify,merge, publish, distribute, sublicense,
+          # and/or sell copies of the Software, and to permit persons to whom the
+          # Software is furnished to do so.
+          #
+          # THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+          # OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+          # FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+          # AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+          # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+          # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+          # IN THE SOFTWARE.
+          #
+
+          import boto3
+          import json
+          import logging
+          import botocore.exceptions
+          import os
+
+          LOG_LEVEL = os.getenv('LOG_LEVEL')
+          logging.getLogger().setLevel(LOG_LEVEL)
+
+          def get_exclusions(group_name='compute'):
+              dynamodb = boto3.client('dynamodb')
+              response = dynamodb.get_item(
+                  TableName='AWSConfigExclusions',
+                  Key={'group_name': {'S': group_name}}
+              )
+              
+              if 'Item' not in response:
+                  return None
+              
+              item = response['Item']
+              
+              group_name = item['group_name']['S']
+              accounts = []
+              if 'accounts' in item:
+                  accounts = [account['M']['account']['S'] for account in item['accounts']['L']]
+              
+              exclusions = []
+              if 'exclusions' in item:
+                  exclusions = [exclusion['S'] for exclusion in item['exclusions']['L']]
+              
+              return {
+                  'group_name': group_name,
+                  'accounts': accounts,
+                  'exclusions': exclusions
+              }
+
+
+          def lambda_handler(event, context):
+              try:
+                  logging.info('Get Exclusions...')
+                  data = get_exclusions("compute")
+                  logging.info(f'Exlusion Data: {data}')
+
+                  if not data:
+                      raise Exception('No data from DynamoDB')
+
+                  account_ids = data['accounts']
+                  exclusions = data['exclusions']
+
+                  if not account_ids or not exclusions:
+                      raise Exception('Missing data in DynamoDB response')
+
+                  bc = botocore.__version__
+                  b3 = boto3.__version__
+
+                  logging.info(f'Botocore : {bc}')
+                  logging.info(f'Boto3 : {b3}')
+
+                  STS = boto3.client("sts")
+
+                  def assume_role(account_id, role='AWSControlTowerExecution'):
+                      curr_account = STS.get_caller_identity()['Account']
+                      logging.info(f'Current account: {curr_account} vs. target account: {account_id}')
+
+                      if curr_account != account_id:
+                          part = STS.get_caller_identity()['Arn'].split(":")[1]
+                          role_arn = f'arn:{part}:iam::{account_id}:role/{role}'
+                          ses_name = f'{account_id}-{role}'
+                          response = STS.assume_role(RoleArn=role_arn, RoleSessionName=ses_name)
+                          sts_session = boto3.Session(
+                              aws_access_key_id=response['Credentials']['AccessKeyId'],
+                              aws_secret_access_key=response['Credentials']['SecretAccessKey'],
+                              aws_session_token=response['Credentials']['SessionToken'])
+
+                          return sts_session
+
+                      logging.warning(f'Control Tower role already assumed in account {account_id}')
+                      raise Exception(f'Control Tower role already assumed in account {account_id}')
+
+                  logging.info(f'Getting Account IDs: {data['accounts']}')
+                  logging.info(f'Number of accounts: {len(data["accounts"])}')
+                  for accounts in data['accounts']:
+
+                      accounts = json.loads(accounts)
+                      logging.info(f'accounts: {accounts}')
+
+                      account_id = accounts['account']
+                      logging.info(f'Account ID: {account_id}')
+                      logging.info(f'role_arn: arn:aws:iam::{account_id}:role/aws-controltower-ConfigRecorderRole')
+                      sts_session = assume_role(account_id)
+                      logging.info(f'Printing STS session: {sts_session}')
+
+                      for aws_region in accounts['data']['regions']:
+                          configservice = sts_session.client('config', region_name=aws_region)
+                          logging.info(f'Excluding: {exclusions}')
+                          role_arn = f'arn:aws:iam::{account_id}:role/aws-controltower-ConfigRecorderRole'
+                          # Convert the data to a JSON string for printing
+                          config_data = {
+                              'name': 'aws-controltower-BaselineConfigRecorder',
+                              'roleARN': role_arn,
+                              'recordingGroup': {
+                                  'allSupported': False,
+                                  'exclusionByResourceTypes': {
+                                      'resourceTypes': exclusions
+                                  },
+                                  'recordingStrategy': {
+                                      'useOnly': 'EXCLUSION_BY_RESOURCE_TYPES'
+                                  }
+                              }
+                          }
+
+                          print("Data being sent to AWS Config API:")
+                          print(json.dumps(config_data, separators=(',', ':')))  # Print JSON data without whitespace characters
+
+                          # Make the API call
+                          response = configservice.put_configuration_recorder(ConfigurationRecorder=config_data)
+                          logging.info(f'Pre Change Configuration recorder : {response}')
+                          configrecorder = configservice.describe_configuration_recorders()
+                          logging.info(f'Post Change Configuration recorder : {configrecorder}')
+
+                  return {
+                      'statusCode': 200
+                  }
+
+              except Exception as e:
+                  exception_type = e.__class__.__name__
+                  exception_message = str(e)
+                  logging.exception(f'{exception_type}: {exception_message}')
+                  raise
+
+
+
+
+      Runtime: python3.9
+      Timeout: 600
+
+  ConfigExclusionsRole:
+    Type: 'AWS::IAM::Role'
+    Properties: 
+      RoleName: ConfigExclusionsRole
+      AssumeRolePolicyDocument: 
+        Version: '2012-10-17'
+        Statement: 
+          - Effect: 'Allow'
+            Principal: 
+              Service: 'lambda.amazonaws.com'
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: LambdaDynamoDBReadOnlyPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: 'Allow'
+                Action:
+                  - 'dynamodb:GetItem'
+                  - 'dynamodb:Scan'
+                  - 'dynamodb:Query'
+                  - 'dynamodb:BatchGetItem'
+                  - 'dynamodb:DescribeTable'
+                Resource: !Sub arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/AWSConfigExclusions
+        - PolicyName: LambdaExecutePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: 'Allow'
+                Action:
+                  - 'lambda:InvokeFunction'
+                Resource: '*'
+        - PolicyName: LambdaAssumeRolePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: 'Allow'
+                Action:
+                  - 'sts:AssumeRole'
+                Resource: '*'
