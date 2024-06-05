@@ -208,6 +208,17 @@ Resources:
                 Action:
                   - 'lambda:InvokeFunction'
                 Resource: '*'
+        - PolicyName: LambdaLoggingPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: 'Allow'
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:DescribeLogStreams'
+                  - 'logs:PutLogEvents'
+                Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group/*
         - PolicyName: LambdaAssumeRolePolicy
           PolicyDocument:
             Version: '2012-10-17'
